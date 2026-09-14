@@ -1,11 +1,11 @@
 # PDF to Markdown Converter
 
-Converts PDF files into Markdown (`.md`) files, preserving headings, tables, lists, and bold/italic text.
+Converts PDF and HTML files into Markdown (`.md`) files, preserving headings, tables, lists, and bold/italic text.
 
 ## Web app (recommended)
 
 Double-click **Start-Web-App.bat** — it opens http://localhost:5001 in your browser.
-Drop one or more PDFs onto the page (or click to browse). Every converted file is
+Drop one or more PDFs or HTML files onto the page (or click to browse). Every converted file is
 **automatically saved to `Downloads\markdown`** — no clicking needed. Each file also
 gets Preview and Download buttons on the page, plus a "Download all" button.
 Runs entirely on your computer — no files leave your machine.
@@ -33,7 +33,7 @@ python pdf2md.py file.pdf --pages 1-5      # only convert specific pages (also: 
 ## Requirements
 
 - Python 3.10+
-- `pip install pymupdf4llm` (already installed)
+- `pip install pymupdf4llm markdownify beautifulsoup4` (already installed)
 
 ## Scanned pages (OCR)
 

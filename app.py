@@ -1,9 +1,10 @@
-"""PDF to Markdown web app.
+"""PDF/HTML to Markdown web app.
 
 Run:  python app.py
-Then open http://localhost:5000 in your browser.
-Upload one or more PDFs; each converted .md file is automatically saved to
-your Downloads\\markdown folder, and can also be downloaded from the page.
+Then open http://localhost:5001 in your browser.
+Upload one or more PDF or HTML files; each converted .md file is
+automatically saved to your Downloads\\markdown folder, and can also be
+downloaded from the page.
 """
 
 import io
@@ -16,6 +17,8 @@ from pathlib import Path
 import pymupdf
 import pymupdf4llm
 from flask import Flask, render_template_string, request
+from bs4 import BeautifulSoup
+from markdownify import markdownify
 
 # OCR is optional: if Tesseract or the wrapper is missing, the app still runs
 # (just without scanned-page support).
@@ -92,6 +95,35 @@ def page_to_markdown(doc: pymupdf.Document, index: int, use_ocr: bool) -> tuple[
         return plain + "\n\n", False
 
 
+def save_result(job_id: str, original_name: str, markdown: str, ocr_pages: int = 0) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    saved = unique_path(OUTPUT_DIR, Path(original_name).stem)
+    saved.write_text(markdown, encoding="utf-8")
+    with JOBS_LOCK:
+        JOBS[job_id].update(
+            status="done", markdown=markdown, name=saved.stem,
+            saved_to=str(saved), ocr_pages=ocr_pages,
+        )
+
+
+def run_html_conversion(job_id: str, tmp_path: Path, original_name: str) -> None:
+    try:
+        html = tmp_path.read_text(encoding="utf-8", errors="replace")
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["title", "script", "style", "head"]):
+            tag.decompose()
+        markdown = markdownify(str(soup), heading_style="ATX").strip() + "\n"
+        with JOBS_LOCK:
+            JOBS[job_id]["total_pages"] = 1
+            JOBS[job_id]["done_pages"] = 1
+        save_result(job_id, original_name, markdown)
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="error", error=f"Could not convert this HTML file: {e}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def run_conversion(job_id: str, tmp_path: Path, original_name: str, use_ocr: bool) -> None:
     """Convert page by page so progress can be reported."""
     try:
@@ -112,16 +144,7 @@ def run_conversion(job_id: str, tmp_path: Path, original_name: str, use_ocr: boo
                 JOBS[job_id]["ocr_pages"] = ocr_pages
         doc.close()
         markdown = "".join(parts)
-
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        saved = unique_path(OUTPUT_DIR, Path(original_name).stem)
-        saved.write_text(markdown, encoding="utf-8")
-
-        with JOBS_LOCK:
-            JOBS[job_id].update(
-                status="done", markdown=markdown, name=saved.stem,
-                saved_to=str(saved), ocr_pages=ocr_pages,
-            )
+        save_result(job_id, original_name, markdown, ocr_pages)
     except Exception as e:
         with JOBS_LOCK:
             JOBS[job_id].update(status="error", error=f"Could not convert this PDF: {e}")
@@ -223,14 +246,14 @@ PAGE = """
 <body>
 <div class="container">
   <h1>PDF &rarr; Markdown</h1>
-  <p class="subtitle">Upload one or many PDFs &mdash; headings, tables and lists preserved.</p>
+  <p class="subtitle">Upload one or many PDFs or HTML files &mdash; headings, tables and lists preserved.</p>
   <p class="savenote">Converted files are saved automatically to <code>Downloads\\markdown</code></p>
 
   <div id="dropzone">
     <div class="icon">&#128196;</div>
-    <p><strong>Drop your PDFs here</strong> or click to browse</p>
+    <p><strong>Drop your PDFs or HTML files here</strong> or click to browse</p>
     <p class="hint">Select as many files as you like &middot; up to 100 MB each</p>
-    <input type="file" id="file-input" accept=".pdf,application/pdf" multiple>
+    <input type="file" id="file-input" accept=".pdf,application/pdf,.html,.htm,text/html" multiple>
   </div>
 
   <label id="ocr-toggle">
@@ -295,8 +318,9 @@ async function handleFiles(files) {
     const item = addItem(file.name);
     const fileLabel = files.length > 1 ? "File " + (f + 1) + " of " + files.length + ": " : "";
 
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      setStatus(item, "failed", "Skipped - not a PDF file");
+    const lower = file.name.toLowerCase();
+    if (!lower.endsWith(".pdf") && !lower.endsWith(".html") && !lower.endsWith(".htm")) {
+      setStatus(item, "failed", "Skipped - not a PDF or HTML file");
       failed++;
       updateBar(f, files.length, 1, fileLabel + file.name + " skipped");
       continue;
@@ -422,21 +446,30 @@ def convert():
     file = request.files.get("file")
     if not file or not file.filename:
         return {"error": "No file was uploaded."}, 400
-    if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF files are supported."}, 400
+    name = file.filename.lower()
+    is_html = name.endswith(".html") or name.endswith(".htm")
+    if not (name.endswith(".pdf") or is_html):
+        return {"error": "Only PDF or HTML files are supported."}, 400
 
     # Stage the upload in a temp file, then convert in a background thread
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+    suffix = ".html" if is_html else ".pdf"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         file.save(tmp)
         tmp_path = Path(tmp.name)
 
-    use_ocr = request.form.get("ocr", "true").lower() != "false"
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
         JOBS[job_id] = {"status": "working", "done_pages": 0, "total_pages": 0, "ocr_pages": 0}
-    threading.Thread(
-        target=run_conversion, args=(job_id, tmp_path, file.filename, use_ocr), daemon=True
-    ).start()
+
+    if is_html:
+        threading.Thread(
+            target=run_html_conversion, args=(job_id, tmp_path, file.filename), daemon=True
+        ).start()
+    else:
+        use_ocr = request.form.get("ocr", "true").lower() != "false"
+        threading.Thread(
+            target=run_conversion, args=(job_id, tmp_path, file.filename, use_ocr), daemon=True
+        ).start()
     return {"job": job_id}
 
 
